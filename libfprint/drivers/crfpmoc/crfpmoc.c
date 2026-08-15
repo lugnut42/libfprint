@@ -49,6 +49,7 @@ G_DEFINE_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FP_TYPE_DEVICE)
 
 static void crfpmoc_finger_up_run_state (FpiSsm   *ssm,
                                          FpDevice *device);
+static void handle_enroll_wait_finger_up (FpiSsm *ssm);
 static void crfpmoc_clear_storage_run_state (FpiSsm   *ssm,
                                              FpDevice *device);
 static void crfpmoc_keys_run_state (FpiSsm   *ssm,
@@ -86,8 +87,12 @@ typedef struct
 /* Data for the enroll state machine */
 typedef struct
 {
-  int stage;
+  guint32 magic;
+  int     stage;
+  int     enroll_error_code;
 } EnrollData;
+
+#define CRFPMOC_ENROLL_DATA_MAGIC 0x4352454e
 
 /* Data for the download sub-SSM */
 typedef struct
@@ -152,8 +157,7 @@ subssm_data_free (void *arg)
   SubSsmData *data = arg;
 
   /* Cancel any poll source */
-  fp_dbg ("crfpmoc_ssm_data_free: data %p remove poll source %d stream %p",
-          data, data->poll_source, (void *) data->poll_input_stream);
+  fp_dbg ("crfpmoc_ssm_data_free: remove poll source %d", data->poll_source);
   g_clear_handle_id (&data->poll_source, g_source_remove);
 
   g_clear_object (&data->poll_input_stream);
@@ -185,9 +189,6 @@ crfpmoc_ssm_start_subsm_full (FpiDeviceCrfpMoc *self,
   data->parent_ssm = ssm;
   data->sub_data = sub_data;
   data->sub_data_destroy = sub_data_destroy;
-
-  fp_dbg ("crfpmoc_ssm_start_subsm: new sub ssm %p data %p parent %p",
-          (void *) ssm, (void *) data, (void *) data->parent_ssm);
 
   fpi_ssm_set_data (ssm, g_steal_pointer (&data), subssm_data_free);
   fpi_ssm_start_subsm (self->task_ssm, ssm);
@@ -418,8 +419,7 @@ crfpmoc_read_bytes (gpointer stream, gpointer user_data)
 
   (void) stream;
 
-  fp_dbg ("crfpmoc_read_bytes: called, ssm %p data %p poll_source %d stream %p",
-          (void *) ssm, (void *) data, data->poll_source, (void *) data->poll_input_stream);
+  fp_dbg ("crfpmoc_read_bytes: called");
 
   /* If there is an active timeout on this state machine remove it */
   g_clear_pointer (&data->timeout, g_source_destroy);
@@ -485,6 +485,12 @@ crfpmoc_read_bytes (gpointer stream, gpointer user_data)
         {
           guint error_code = CRFPMOC_EC_MKBP_FP_ERRCODE (buffer.data.fp_events);
           const gchar *reason = NULL;
+
+          /* Remember the result so that the enroll check callback can
+           * report progress or an accurate retry reason. */
+          if (data->sub_data &&
+              ((EnrollData *) data->sub_data)->magic == CRFPMOC_ENROLL_DATA_MAGIC)
+            ((EnrollData *) data->sub_data)->enroll_error_code = error_code;
 
           fp_dbg ("  Enroll progress %d", CRFPMOC_EC_MKBP_FP_ENROLL_PROGRESS (buffer.data.fp_events));
           switch (error_code)
@@ -602,8 +608,6 @@ crfpmoc_eventmask_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
     fpi_device_get_cancellable (device));
   g_source_set_callback (poll_source, (GSourceFunc) crfpmoc_read_bytes, ssm, NULL);
   data->poll_source = g_source_attach (poll_source, NULL);
-  fp_dbg ("crfpmoc_eventmask_cb: ssm %p data %p fd %d poll_source %d",
-          (void *) ssm, (void *) data, fd, data->poll_source);
 }
 
 /* Enable device event reporting and queue a callback when there is
@@ -622,13 +626,11 @@ crfpmoc_finger_up_mode_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
-      fp_dbg ("crfpmoc_finger_up_mode_cb: ssm %p failed: %s", (void *) ssm, error->message);
       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
       return;
     }
 
   /* Submit eventmask to wait for finger up */
-  fp_dbg ("crfpmoc_finger_up_mode_cb: ssm %p submitting eventmask", (void *) ssm);
   em_transfer = crfpmoc_ec_transfer_new_eventmask (
     device, 1 << CRFPMOC_EC_MKBP_EVENT_FINGERPRINT);
   crfpmoc_ec_transfer_submit_eventmask (em_transfer, fpi_device_get_cancellable (device),
@@ -659,25 +661,50 @@ crfpmoc_enroll_check_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
     {
       if (mode & CRFPMOC_FP_MODE_ENROLL_IMAGE)
         {
+          /* Still waiting for the current capture to complete */
           fpi_ssm_jump_to_state (ssm, ENROLL_WAIT_ENROLL_COMPLETE);
         }
       else
         {
-          fpi_device_report_finger_status_changes (device,
-                                                   FP_FINGER_STATUS_PRESENT,
-                                                   FP_FINGER_STATUS_NONE);
-          fpi_device_enroll_progress (device, enroll_data->stage, NULL,
-                                      fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                                                                "FP mode: (0x%x)", mode));
-          fpi_ssm_jump_to_state (ssm, ENROLL_SENSOR_ENROLL_SUBMIT);
+          /* A capture just completed. Report progress or an accurate
+           * retry reason based on the error code reported by the EC,
+           * then wait for the finger to be lifted before requesting
+           * the next capture. */
+          switch (enroll_data->enroll_error_code)
+            {
+            case CRFPMOC_EC_MKBP_FP_ERR_ENROLL_OK:
+              enroll_data->stage++;
+              fpi_device_enroll_progress (device, enroll_data->stage, NULL, NULL);
+              break;
+
+            case CRFPMOC_EC_MKBP_FP_ERR_ENROLL_IMMOBILE:
+              fpi_device_enroll_progress (device, enroll_data->stage, NULL,
+                                          fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+              break;
+
+            case CRFPMOC_EC_MKBP_FP_ERR_ENROLL_LOW_COVERAGE:
+              fpi_device_enroll_progress (device, enroll_data->stage, NULL,
+                                          fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+              break;
+
+            default:
+              fpi_device_enroll_progress (device, enroll_data->stage, NULL,
+                                          fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+              break;
+            }
+
+          fpi_ssm_jump_to_state (ssm, ENROLL_WAIT_FINGER_UP);
         }
     }
   else if (mode == 0)
     {
+      /* Enrollment session finished, all captures have been added. */
+      enroll_data->stage++;
+      fpi_device_enroll_progress (device, enroll_data->stage, NULL, NULL);
       fpi_device_report_finger_status_changes (device,
                                                FP_FINGER_STATUS_PRESENT,
                                                FP_FINGER_STATUS_NONE);
-      fpi_ssm_next_state (ssm);
+      fpi_ssm_jump_to_state (ssm, ENROLL_COMMIT);
     }
   else
     {
@@ -1394,11 +1421,12 @@ crfpmoc_ssm_timeout (FpDevice *device, gpointer user_data)
 static void
 handle_wait_finger_up (FpiSsm *ssm,
                        int     state,
-                       int     timeout)
+                       int     timeout,
+                       guint32 mode)
 {
   FpDevice *device = fpi_ssm_get_device (ssm);
   SubSsmData *data = fpi_ssm_get_data (ssm);
-  struct crfpmoc_ec_params_fp_mode p = { .mode = CRFPMOC_FP_MODE_FINGER_UP };
+  struct crfpmoc_ec_params_fp_mode p = { .mode = mode };
   CrfpMocEcTransfer *transfer;
 
   data->timeout_state = state;
@@ -1520,11 +1548,9 @@ crfpmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
       handle_enroll_wait_enroll_complete (ssm);
       break;
 
-#ifdef WAIT_ON_ENROLL
     case ENROLL_WAIT_FINGER_UP:
-      handle_wait_finger_up (ssm, FINGER_UP_TIMEOUT, 5000);
+      handle_enroll_wait_finger_up (ssm);
       break;
-#endif
 
     case ENROLL_SENSOR_CHECK:
       handle_enroll_sensor_check (ssm);
@@ -1554,6 +1580,7 @@ crfpmoc_enroll (FpDevice *device)
   fp_dbg ("Enroll");
 
   enroll_data = g_new0 (EnrollData, 1);
+  enroll_data->magic = CRFPMOC_ENROLL_DATA_MAGIC;
   enroll_data->stage = 0;
 
   g_assert (self->task_ssm == NULL);
@@ -1770,6 +1797,50 @@ handle_verify_finger_up (FpiSsm *ssm)
   crfpmoc_ssm_start_subsm (FPI_DEVICE_CRFPMOC (device), sub);
 }
 
+static void
+crfpmoc_enroll_finger_up_done (FpiSsm *sub, FpDevice *device, GError *error)
+{
+  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+  FpiSsm *parent = self->task_ssm;
+
+  if (error)
+    {
+      /* Finger was not lifted in time, keep waiting for it. */
+      SubSsmData *data = fpi_ssm_get_data (parent);
+      EnrollData *enroll_data = data->sub_data;
+
+      fpi_device_enroll_progress (device, enroll_data->stage, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+      fpi_ssm_jump_to_state (parent, ENROLL_WAIT_FINGER_UP);
+    }
+  else
+    {
+      /* Finger lifted: request the next capture. */
+      fpi_ssm_jump_to_state (parent, ENROLL_SENSOR_ENROLL_SUBMIT);
+    }
+}
+
+static void
+handle_enroll_wait_finger_up (FpiSsm *ssm)
+{
+  FpDevice *device = fpi_ssm_get_device (ssm);
+  FpiSsm *sub = fpi_ssm_new (device, crfpmoc_finger_up_run_state,
+                             FINGER_UP_STATES);
+  SubSsmData *data = g_new0 (SubSsmData, 1);
+  guint32 *extra_mode = g_new (guint32, 1);
+
+  /* Keep the enroll session active while waiting for the finger to be
+   * lifted, otherwise the EC tears the session down (resetting the
+   * enrollment progress). */
+  *extra_mode = CRFPMOC_FP_MODE_ENROLL_SESSION;
+
+  data->parent_ssm = sub;
+  data->sub_data = extra_mode;
+  data->sub_data_destroy = g_free;
+  fpi_ssm_set_data (sub, g_steal_pointer (&data), subssm_data_free);
+  fpi_ssm_start (sub, crfpmoc_enroll_finger_up_done);
+}
+
 /* Clear storage state machine */
 static void
 crfpmoc_verify_run_state (FpiSsm *ssm, FpDevice *device)
@@ -1827,7 +1898,17 @@ crfpmoc_finger_up_run_state (FpiSsm *ssm, FpDevice *device)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case FINGER_UP_START:
-      handle_wait_finger_up (ssm, FINGER_UP_TIMEOUT, 5000);
+      {
+        SubSsmData *data = fpi_ssm_get_data (ssm);
+        guint32 mode = CRFPMOC_FP_MODE_FINGER_UP;
+
+        /* Allow callers to keep extra mode bits (e.g. ENROLL_SESSION)
+         * set while waiting for the finger to be lifted. */
+        if (data->sub_data)
+          mode |= *(guint32 *) data->sub_data;
+
+        handle_wait_finger_up (ssm, FINGER_UP_TIMEOUT, 5000, mode);
+      }
       break;
 
     case FINGER_UP_DONE:

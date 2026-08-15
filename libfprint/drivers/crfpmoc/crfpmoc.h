@@ -460,9 +460,7 @@ enum {
   ENROLL_SENSOR_ENROLL_DONE,   /* Enroll mode set */
   ENROLL_WAIT_ENROLL_COMPLETE, /* Wait for command completion event */
   ENROLL_SENSOR_CHECK,         /* Verify mode has indicated completion */
-#ifdef WAIT_ON_ENROLL
   ENROLL_WAIT_FINGER_UP,       /* Wait for finger to be removed */
-#endif
   ENROLL_COMMIT,               /* Download template and return print  */
   ENROLL_RESET,                /* Reset sensor to idle */
   ENROLL_STATES,
