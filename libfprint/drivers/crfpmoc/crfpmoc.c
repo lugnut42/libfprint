@@ -1064,9 +1064,13 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
   fpi_device_open_complete (device, error);
 }
 
-/* Initialise the per-session encryption seed and user context. In emulation
- * mode fixed test values are used so the recorded ioctl replay stays
- * deterministic; on real hardware random values are generated.
+/* Initialise the per-session encryption seed and user context. ChromeOS
+ * derives these from the TPM, but there is no way for this driver to do
+ * the same. Use fixed values so that the encryption key is deterministic:
+ * templates stay usable across sessions, driver restarts and EC resets.
+ * The seed must be non-zero, the EC rejects trivial seeds in get_ikm().
+ * The user context must also be non-zero, otherwise the EC does not set
+ * USER_ID_SET and the uploaded template is never decrypted.
  */
 static void
 crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
@@ -1076,19 +1080,8 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
   G_STATIC_ASSERT (sizeof (CRFPMOC_DEFAULT_SEED) - 1 == CRFPMOC_FP_CONTEXT_TPM_BYTES);
   G_STATIC_ASSERT (sizeof (CRFPMOC_DEFAULT_CONTEXT) - 1 == CRFPMOC_FP_CONTEXT_USERID_BYTES);
 
-  if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
-    {
-      memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
-      memcpy (self->context, CRFPMOC_DEFAULT_CONTEXT, sizeof (self->context));
-    }
-  else
-    {
-      for (size_t i = 0; i < sizeof (self->seed); i++)
-        self->seed[i] = (guint8) g_random_int_range (0, 256);
-
-      for (size_t i = 0; i < sizeof (self->context); i++)
-        self->context[i] = (guint8) g_random_int_range (0, 256);
-    }
+  memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
+  memcpy (self->context, CRFPMOC_DEFAULT_CONTEXT, sizeof (self->context));
 }
 
 static void
@@ -2088,6 +2081,10 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         struct crfpmoc_ec_params_fp_context_v1 p = {
           .action = CRFPMOC_FP_CONTEXT_GET_RESULT,
         };
+        /* The EC uses the user id from GET_RESULT to set the user
+         * context and the USER_ID_SET flag, which in turn enables
+         * template decryption during the upload commit. */
+        memcpy (p.userid, self->context, sizeof (p.userid));
         transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_CONTEXT, 1,
                                                 &p, sizeof (p), 0);
         crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
