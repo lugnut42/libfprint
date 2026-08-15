@@ -152,7 +152,8 @@ subssm_data_free (void *arg)
   SubSsmData *data = arg;
 
   /* Cancel any poll source */
-  fp_dbg ("crfpmoc_ssm_data_free: remove poll source %d", data->poll_source);
+  fp_dbg ("crfpmoc_ssm_data_free: data %p remove poll source %d stream %p",
+          data, data->poll_source, (void *) data->poll_input_stream);
   g_clear_handle_id (&data->poll_source, g_source_remove);
 
   g_clear_object (&data->poll_input_stream);
@@ -184,6 +185,9 @@ crfpmoc_ssm_start_subsm_full (FpiDeviceCrfpMoc *self,
   data->parent_ssm = ssm;
   data->sub_data = sub_data;
   data->sub_data_destroy = sub_data_destroy;
+
+  fp_dbg ("crfpmoc_ssm_start_subsm: new sub ssm %p data %p parent %p",
+          (void *) ssm, (void *) data, (void *) data->parent_ssm);
 
   fpi_ssm_set_data (ssm, g_steal_pointer (&data), subssm_data_free);
   fpi_ssm_start_subsm (self->task_ssm, ssm);
@@ -403,7 +407,7 @@ crfpmoc_umockdev_record (FpiDeviceCrfpMoc *self, int res,
  * to see if a timeout is active.
  */
 static gboolean
-crfpmoc_read_bytes (gpointer user_data)
+crfpmoc_read_bytes (gpointer stream, gpointer user_data)
 {
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
@@ -412,7 +416,10 @@ crfpmoc_read_bytes (gpointer user_data)
   struct crfpmoc_ec_response_get_next_event_v1 buffer = {0};
   gssize rv;
 
-  fp_dbg ("crfpmoc_read_bytes: called");
+  (void) stream;
+
+  fp_dbg ("crfpmoc_read_bytes: called, ssm %p data %p poll_source %d stream %p",
+          (void *) ssm, (void *) data, data->poll_source, (void *) data->poll_input_stream);
 
   /* If there is an active timeout on this state machine remove it */
   g_clear_pointer (&data->timeout, g_source_destroy);
@@ -451,7 +458,7 @@ crfpmoc_read_bytes (gpointer user_data)
       fpi_ssm_mark_failed (ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                                      "Error polling for MKBP event: %s",
-                                                     error->message));
+                                                     error ? error->message : "unknown"));
       return G_SOURCE_REMOVE;
     }
 
@@ -593,8 +600,10 @@ crfpmoc_eventmask_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
   GSource *poll_source = g_pollable_input_stream_create_source (
     G_POLLABLE_INPUT_STREAM (data->poll_input_stream),
     fpi_device_get_cancellable (device));
-  g_source_set_callback (poll_source, crfpmoc_read_bytes, ssm, NULL);
+  g_source_set_callback (poll_source, (GSourceFunc) crfpmoc_read_bytes, ssm, NULL);
   data->poll_source = g_source_attach (poll_source, NULL);
+  fp_dbg ("crfpmoc_eventmask_cb: ssm %p data %p fd %d poll_source %d",
+          (void *) ssm, (void *) data, fd, data->poll_source);
 }
 
 /* Enable device event reporting and queue a callback when there is
@@ -613,11 +622,13 @@ crfpmoc_finger_up_mode_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
+      fp_dbg ("crfpmoc_finger_up_mode_cb: ssm %p failed: %s", (void *) ssm, error->message);
       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
       return;
     }
 
   /* Submit eventmask to wait for finger up */
+  fp_dbg ("crfpmoc_finger_up_mode_cb: ssm %p submitting eventmask", (void *) ssm);
   em_transfer = crfpmoc_ec_transfer_new_eventmask (
     device, 1 << CRFPMOC_EC_MKBP_EVENT_FINGERPRINT);
   crfpmoc_ec_transfer_submit_eventmask (em_transfer, fpi_device_get_cancellable (device),
@@ -723,7 +734,8 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
       data->clear_step = 1;
       p.mode = CRFPMOC_FP_MODE_RESET_SENSOR;
       new_transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                                  &p, sizeof (p), 0);
+                                                  &p, sizeof (p),
+                                                  sizeof (struct crfpmoc_ec_response_fp_mode));
       crfpmoc_ec_transfer_submit_cmd (new_transfer, fpi_device_get_cancellable (device),
                                       crfpmoc_clear_storage_cb, ssm);
     }
@@ -1339,7 +1351,8 @@ handle_enroll_reset (FpiSsm *ssm)
   CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                          &p, sizeof (p), 0);
+                                          &p, sizeof (p),
+                                          sizeof (struct crfpmoc_ec_response_fp_mode));
   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
 }
 
@@ -1611,7 +1624,8 @@ handle_verify_reset (FpiSsm *ssm)
   CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                          &p, sizeof (p), 0);
+                                          &p, sizeof (p),
+                                          sizeof (struct crfpmoc_ec_response_fp_mode));
   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
 }
 
@@ -1841,7 +1855,8 @@ crfpmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
       data->clear_step = 0;
 
       transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                              &p, sizeof (p), 0);
+                                              &p, sizeof (p),
+                                              sizeof (struct crfpmoc_ec_response_fp_mode));
       crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                       crfpmoc_clear_storage_cb, ssm);
       break;
