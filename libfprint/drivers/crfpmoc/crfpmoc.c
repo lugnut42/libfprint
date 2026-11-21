@@ -2601,6 +2601,24 @@ upload_data_free (gpointer data)
   g_free (data);
 }
 
+/* FP_TEMPLATE fails the final (commit) chunk with EC_RES_UNAVAILABLE when
+ * the firmware cannot derive the key or decrypt the template, i.e. the
+ * print was not encrypted with this machine's seed and user context.
+ * Report that as invalid data rather than a protocol error, which fprintd
+ * would show as a disconnected device. Takes ownership of @error.
+ */
+static GError *
+crfpmoc_template_upload_error (gboolean commit, int ec_result, GError *error)
+{
+  if (!commit || ec_result != EC_RES_UNAVAILABLE)
+    return error;
+
+  g_error_free (error);
+  return fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                   "Stored print cannot be decrypted with this "
+                                   "machine's key; re-enroll it");
+}
+
 static void
 crfpmoc_upload_chunk_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
 {
@@ -2612,14 +2630,18 @@ crfpmoc_upload_chunk_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
   UploadData *udata = data->sub_data;
   gsize max_chunk;
 
+  max_chunk = self->max_outsize -
+              offsetof (struct crfpmoc_ec_params_fp_template, data) - 4;
+
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
-      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+      fpi_ssm_mark_failed (ssm,
+                           crfpmoc_template_upload_error (udata->remaining <= max_chunk,
+                                                          transfer->ec_result,
+                                                          g_steal_pointer (&error)));
       return;
     }
 
-  max_chunk = self->max_outsize -
-              offsetof (struct crfpmoc_ec_params_fp_template, data) - 4;
   guint32 tlen = MIN (max_chunk, udata->remaining);
   udata->offset += tlen;
   udata->remaining -= tlen;

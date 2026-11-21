@@ -42,6 +42,8 @@ typedef struct _CrfpMocEcTransfer
    * length; bytes of indata beyond it are not controller data. */
   gboolean variable_reply;
   int      received;
+  /* EC result code of the last submission (0xff if the ioctl failed) */
+  int      ec_result;
 
   /* For CRFPMOC_CROS_EC_DEV_IOCEVENTMASK_V2 */
   unsigned long event_mask;

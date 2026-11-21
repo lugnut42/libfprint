@@ -174,6 +174,7 @@ command_thread_func (GTask        *task,
   s_cmd = build_raw_cmd (transfer);
 
   r = do_ioctl_xcmd (transfer, s_cmd, &error);
+  transfer->ec_result = s_cmd->result;
 
   if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (transfer->device)))
     {
@@ -394,6 +395,7 @@ crfpmoc_ec_transfer_submit_sync (CrfpMocEcTransfer *transfer,
 
   s_cmd = build_raw_cmd (transfer);
   r = do_ioctl_xcmd (transfer, s_cmd, error);
+  transfer->ec_result = s_cmd->result;
 
   if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (transfer->device)))
     crfpmoc_umockdev_record (FPI_DEVICE_CRFPMOC (transfer->device), r,
