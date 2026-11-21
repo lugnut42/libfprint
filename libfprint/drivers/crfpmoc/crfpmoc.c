@@ -28,6 +28,10 @@
 
 #include "crfpmoc.h"
 #include "crfpmoc-ec-transfer.h"
+#include "crfpmoc-keys.h"
+
+G_STATIC_ASSERT (CRFPMOC_KEYS_SEED_BYTES == CRFPMOC_FP_CONTEXT_TPM_BYTES);
+G_STATIC_ASSERT (CRFPMOC_KEYS_CONTEXT_BYTES == CRFPMOC_FP_CONTEXT_USERID_BYTES);
 
 struct _FpiDeviceCrfpMoc
 {
@@ -40,8 +44,10 @@ struct _FpiDeviceCrfpMoc
   guint16  template_size;
   guint8   fp_info_version; /* negotiated at open, 0 until then */
 
+  /* Valid once keys_loaded is set; cleared on close and finalize */
   guint8   seed[CRFPMOC_FP_CONTEXT_TPM_BYTES];
   guint8   context[CRFPMOC_FP_CONTEXT_USERID_BYTES];
+  gboolean keys_loaded;
 
   int      emul_fd;
 };
@@ -1337,10 +1343,21 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
   fpi_device_open_complete (device, error);
 }
 
-/* Initialise the per-session encryption seed and user context. ChromeOS
- * derives these from the TPM, but there is no way for this driver to do
- * the same. Use fixed values so that the encryption key is deterministic:
- * templates stay usable across sessions, driver restarts and EC resets.
+static void
+crfpmoc_clear_keys (FpiDeviceCrfpMoc *self)
+{
+  explicit_bzero (self->seed, sizeof (self->seed));
+  explicit_bzero (self->context, sizeof (self->context));
+  self->keys_loaded = FALSE;
+}
+
+/* Set up the encryption seed and user context. ChromeOS derives these
+ * from the TPM, which this driver cannot use. They must stay the same for
+ * as long as enrolled prints are kept, so on real hardware they come from
+ * the machine key file (CRFPMOC_KEYS_FILE). That file is loaded, or
+ * created, by the keys state machine on first use (see
+ * crfpmoc_keys_enc_status_cb), so that opening the device never creates
+ * it. Emulation uses fixed values so that ioctl replays are deterministic.
  * The seed must be non-zero, the EC rejects trivial seeds in get_ikm().
  * The user context must also be non-zero, otherwise the EC does not set
  * USER_ID_SET and the uploaded template is never decrypted.
@@ -1353,8 +1370,14 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
   G_STATIC_ASSERT (sizeof (CRFPMOC_DEFAULT_SEED) - 1 == CRFPMOC_FP_CONTEXT_TPM_BYTES);
   G_STATIC_ASSERT (sizeof (CRFPMOC_DEFAULT_CONTEXT) - 1 == CRFPMOC_FP_CONTEXT_USERID_BYTES);
 
-  memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
-  memcpy (self->context, CRFPMOC_DEFAULT_CONTEXT, sizeof (self->context));
+  crfpmoc_clear_keys (self);
+
+  if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
+    {
+      memcpy (self->seed, CRFPMOC_DEFAULT_SEED, sizeof (self->seed));
+      memcpy (self->context, CRFPMOC_DEFAULT_CONTEXT, sizeof (self->context));
+      self->keys_loaded = TRUE;
+    }
 }
 
 static void
@@ -1442,6 +1465,7 @@ crfpmoc_close (FpDevice *device)
   fp_dbg ("Closing device");
 
   crfpmoc_reset_sync (device);
+  crfpmoc_clear_keys (self);
   g_clear_fd (&self->emul_fd, &error);
 
   fpi_device_close_complete (device, g_steal_pointer (&error));
@@ -2255,8 +2279,11 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
 {
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
+  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (fpi_ssm_get_device (ssm));
   struct crfpmoc_ec_response_fp_encryption_status *resp;
   gboolean seed_needed;
+  gboolean key_is_new = FALSE;
+  gboolean send_seed;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
@@ -2274,7 +2301,42 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
       return;
     }
 
-  if (seed_needed)
+  /* Load the machine key on first use. Only create it while the reader
+   * holds no seed, so that a new key is always programmed right away:
+   * a reader seeded with anything else must be reset (rebooted) first. */
+  if (!self->keys_loaded)
+    {
+      if (crfpmoc_keys_load_or_create (CRFPMOC_KEYS_FILE, seed_needed,
+                                       self->seed, self->context,
+                                       &key_is_new, &error))
+        {
+          self->keys_loaded = TRUE;
+          fp_dbg ("crfpmoc_keys_enc_status_cb: machine key %s",
+                  key_is_new ? "created" : "loaded");
+        }
+      else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+        {
+          key_is_new = TRUE;
+          g_clear_error (&error);
+        }
+      else
+        {
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                              "%s", error->message));
+          return;
+        }
+    }
+
+  if (!crfpmoc_keys_seed_action (key_is_new, seed_needed, &send_seed, &error))
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                          "%s", error->message));
+      return;
+    }
+
+  g_assert (self->keys_loaded);
+
+  if (send_seed)
     fpi_ssm_next_state (ssm); /* KEYS_SET_SEED */
   else
     fpi_ssm_jump_to_state (ssm, KEYS_CTX_ASYNC);
@@ -2365,6 +2427,7 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         memcpy (p.seed, self->seed, sizeof (p.seed));
         transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_SEED, 0,
                                                 &p, sizeof (p), 0);
+        explicit_bzero (&p, sizeof (p));
         crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                         crfpmoc_keys_seed_cb, ssm);
         break;
@@ -2378,6 +2441,7 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         memcpy (p.userid, self->context, sizeof (p.userid));
         transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_CONTEXT, 1,
                                                 &p, sizeof (p), 0);
+        explicit_bzero (&p, sizeof (p));
         crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                         crfpmoc_keys_ctx_async_cb, ssm);
         break;
@@ -2394,6 +2458,7 @@ crfpmoc_keys_run_state (FpiSsm *ssm, FpDevice *device)
         memcpy (p.userid, self->context, sizeof (p.userid));
         transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_CONTEXT, 1,
                                                 &p, sizeof (p), 0);
+        explicit_bzero (&p, sizeof (p));
         crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
                                         crfpmoc_keys_ctx_poll_cb, ssm);
         break;
@@ -2735,6 +2800,14 @@ fpi_device_crfpmoc_init (FpiDeviceCrfpMoc *self)
   self->emul_fd = -1;
 }
 
+static void
+fpi_device_crfpmoc_finalize (GObject *object)
+{
+  crfpmoc_clear_keys (FPI_DEVICE_CRFPMOC (object));
+
+  G_OBJECT_CLASS (fpi_device_crfpmoc_parent_class)->finalize (object);
+}
+
 /* Register the device. Note, this function is declared in the
  * G_DEFINE_TYPE macro and registered there.
  */
@@ -2742,6 +2815,9 @@ static void
 fpi_device_crfpmoc_class_init (FpiDeviceCrfpMocClass *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->finalize = fpi_device_crfpmoc_finalize;
 
   dev_class->id = FP_COMPONENT;
   dev_class->full_name = CRFPMOC_DRIVER_FULLNAME;

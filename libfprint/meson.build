@@ -105,6 +105,7 @@ driver_sources = {
     'crfpmoc' : files(
         'drivers/crfpmoc/crfpmoc.c',
         'drivers/crfpmoc/crfpmoc-ec-transfer.c',
+        'drivers/crfpmoc/crfpmoc-keys.c',
     ),
     'vcom5s' : files('drivers/vcom5s.c'),
     'vfs101' : files('drivers/vfs101.c'),
