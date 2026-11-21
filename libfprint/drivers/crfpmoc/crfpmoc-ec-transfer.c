@@ -112,8 +112,21 @@ do_ioctl_xcmd (CrfpMocEcTransfer                 *transfer,
       return -1;
     }
 
+  /* Current callers require a complete fixed-size reply (including frame
+   * chunks), or no reply. Never let zero-filled allocation tails stand in
+   * for missing controller data, or silently truncate an oversized reply. */
+  if (r != transfer->insize)
+    {
+      g_set_error (error,
+                   FP_DEVICE_ERROR,
+                   FP_DEVICE_ERROR_PROTO,
+                   "Unexpected reply size: got %d, expected %d",
+                   r, transfer->insize);
+      return -1;
+    }
+
   if (transfer->insize > 0 && transfer->indata)
-    memcpy (transfer->indata, s_cmd->data, MIN (r, transfer->insize));
+    memcpy (transfer->indata, s_cmd->data, r);
 
   return r;
 }
