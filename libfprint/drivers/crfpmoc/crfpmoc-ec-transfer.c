@@ -37,8 +37,8 @@ crfpmoc_ec_transfer_log_cmd (CrfpMocEcTransfer *transfer)
            "outsize %d, insize %d",
            transfer, transfer->command, transfer->outsize, transfer->insize);
 
-  if (transfer->outdata)
-    fp_dbg_hex_dump_data (transfer->outdata, transfer->outsize);
+  /* Requests may contain seeds, user contexts, or biometric templates.
+   * Keep transfer diagnostics metadata-only for every command. */
 }
 
 static void
