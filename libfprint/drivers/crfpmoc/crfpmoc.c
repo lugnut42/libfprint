@@ -2115,6 +2115,29 @@ crfpmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
     }
 }
 
+/* FP_SEED must be sent exactly when the firmware reports the seed bit clear.
+ * status is a flag word (session/nonce/user id bits are independent of the
+ * seed), and the seed cannot be replaced once set, so refuse to guess when
+ * the seed bit is not among valid_flags.
+ */
+static gboolean
+crfpmoc_seed_needed (guint32   valid_flags,
+                     guint32   status,
+                     gboolean *needed,
+                     GError  **error)
+{
+  if (!(valid_flags & CRFPMOC_FP_ENC_STATUS_SEED_SET))
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "FP_ENC_STATUS does not report seed state (valid flags 0x%08x)",
+                   valid_flags);
+      return FALSE;
+    }
+
+  *needed = !(status & CRFPMOC_FP_ENC_STATUS_SEED_SET);
+  return TRUE;
+}
+
 /* Keys sub-SSM callbacks */
 static void
 crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
@@ -2122,6 +2145,7 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
   struct crfpmoc_ec_response_fp_encryption_status *resp;
+  gboolean seed_needed;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
@@ -2130,9 +2154,16 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
     }
 
   resp = (struct crfpmoc_ec_response_fp_encryption_status *) transfer->indata;
-  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: %d", resp->status);
+  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: 0x%x (valid 0x%x)",
+          resp->status, resp->valid_flags);
 
-  if (resp->status == 0)
+  if (!crfpmoc_seed_needed (resp->valid_flags, resp->status, &seed_needed, &error))
+    {
+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+      return;
+    }
+
+  if (seed_needed)
     fpi_ssm_next_state (ssm); /* KEYS_SET_SEED */
   else
     fpi_ssm_jump_to_state (ssm, KEYS_CTX_ASYNC);
