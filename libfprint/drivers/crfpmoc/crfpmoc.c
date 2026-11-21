@@ -402,6 +402,28 @@ crfpmoc_umockdev_record (FpiDeviceCrfpMoc *self, int res,
     }
 }
 
+/* Remember an enroll result so that the enroll check callback can report
+ * progress or an accurate retry reason. State machine logic depends on
+ * this, so it must not be skipped when debug logging is disabled.
+ */
+static void
+crfpmoc_mkbp_store_enroll_result (SubSsmData                                        *data,
+                                  const struct crfpmoc_ec_response_get_next_event_v1 *event)
+{
+  guint32 fp_events;
+
+  if ((event->event_type & CRFPMOC_EC_MKBP_EVENT_TYPE_MASK) != CRFPMOC_EC_MKBP_EVENT_FINGERPRINT)
+    return;
+
+  fp_events = event->data.fp_events;
+  if (!(fp_events & CRFPMOC_EC_MKBP_FP_ENROLL))
+    return;
+
+  if (data->sub_data &&
+      ((EnrollData *) data->sub_data)->magic == CRFPMOC_ENROLL_DATA_MAGIC)
+    ((EnrollData *) data->sub_data)->enroll_error_code = CRFPMOC_EC_MKBP_FP_ERRCODE (fp_events);
+}
+
 /* Completion callback for event reporting. Get the event and decode
  * for now. The function may be used with timeout support and if so
  * the timeout needs to be cancelled here. The state machine that
@@ -463,6 +485,8 @@ crfpmoc_read_bytes (gpointer stream, gpointer user_data)
       return G_SOURCE_REMOVE;
     }
 
+  crfpmoc_mkbp_store_enroll_result (data, &buffer);
+
   if (g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN))
     {
       /* Make sure we do not run in the callback context */
@@ -486,12 +510,6 @@ crfpmoc_read_bytes (gpointer stream, gpointer user_data)
         {
           guint error_code = CRFPMOC_EC_MKBP_FP_ERRCODE (buffer.data.fp_events);
           const gchar *reason = NULL;
-
-          /* Remember the result so that the enroll check callback can
-           * report progress or an accurate retry reason. */
-          if (data->sub_data &&
-              ((EnrollData *) data->sub_data)->magic == CRFPMOC_ENROLL_DATA_MAGIC)
-            ((EnrollData *) data->sub_data)->enroll_error_code = error_code;
 
           fp_dbg ("  Enroll progress %d", CRFPMOC_EC_MKBP_FP_ENROLL_PROGRESS (buffer.data.fp_events));
           switch (error_code)
@@ -1776,6 +1794,10 @@ crfpmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
 {
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case ENROLL_SENSOR_IDLE:
+      handle_enroll_reset (ssm);
+      break;
+
     case ENROLL_CHECK_CAPACITY:
       handle_enroll_check_capacity (ssm);
       break;
@@ -2204,6 +2226,29 @@ crfpmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
     }
 }
 
+/* FP_SEED must be sent exactly when the firmware reports the seed bit clear.
+ * status is a flag word (session/nonce/user id bits are independent of the
+ * seed), and the seed cannot be replaced once set, so refuse to guess when
+ * the seed bit is not among valid_flags.
+ */
+static gboolean
+crfpmoc_seed_needed (guint32   valid_flags,
+                     guint32   status,
+                     gboolean *needed,
+                     GError  **error)
+{
+  if (!(valid_flags & CRFPMOC_FP_ENC_STATUS_SEED_SET))
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "FP_ENC_STATUS does not report seed state (valid flags 0x%08x)",
+                   valid_flags);
+      return FALSE;
+    }
+
+  *needed = !(status & CRFPMOC_FP_ENC_STATUS_SEED_SET);
+  return TRUE;
+}
+
 /* Keys sub-SSM callbacks */
 static void
 crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
@@ -2211,6 +2256,7 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
   g_autoptr(GError) error = NULL;
   FpiSsm *ssm = user_data;
   struct crfpmoc_ec_response_fp_encryption_status *resp;
+  gboolean seed_needed;
 
   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
     {
@@ -2219,9 +2265,16 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
     }
 
   resp = (struct crfpmoc_ec_response_fp_encryption_status *) transfer->indata;
-  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: %d", resp->status);
+  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: 0x%x (valid 0x%x)",
+          resp->status, resp->valid_flags);
 
-  if (resp->status == 0)
+  if (!crfpmoc_seed_needed (resp->valid_flags, resp->status, &seed_needed, &error))
+    {
+      fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+      return;
+    }
+
+  if (seed_needed)
     fpi_ssm_next_state (ssm); /* KEYS_SET_SEED */
   else
     fpi_ssm_jump_to_state (ssm, KEYS_CTX_ASYNC);

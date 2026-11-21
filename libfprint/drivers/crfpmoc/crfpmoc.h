@@ -497,6 +497,7 @@ enum {
 /* Enroll state machine states
  */
 enum {
+  ENROLL_SENSOR_IDLE,          /* Clear stale modes so FP_CONTEXT may reset */
   ENROLL_CHECK_CAPACITY,       /* Reject if on-device storage is full */
   ENROLL_ENSURE_KEYS,          /* Setup the seed and context */
   ENROLL_SENSOR_ENROLL_SUBMIT, /* Enter enroll mode (async submit) */
