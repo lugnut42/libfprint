@@ -37,9 +37,9 @@ typedef struct _CrfpMocEcTransfer
   int   outsize;
   void *indata;                /* owned, allocated to insize */
   int   insize;
-  /* With variable_reply set, replies of 0..insize bytes are accepted and
-   * longer ones rejected. received holds the copied reply length; bytes
-   * of indata beyond it are not controller data. */
+  /* Replies must be exactly insize bytes unless variable_reply is set, in
+   * which case 0..insize bytes are accepted. received holds the actual
+   * length; bytes of indata beyond it are not controller data. */
   gboolean variable_reply;
   int      received;
 
