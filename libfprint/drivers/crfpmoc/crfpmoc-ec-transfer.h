@@ -37,6 +37,11 @@ typedef struct _CrfpMocEcTransfer
   int   outsize;
   void *indata;                /* owned, allocated to insize */
   int   insize;
+  /* With variable_reply set, replies of 0..insize bytes are accepted and
+   * longer ones rejected. received holds the copied reply length; bytes
+   * of indata beyond it are not controller data. */
+  gboolean variable_reply;
+  int      received;
 
   /* For CRFPMOC_CROS_EC_DEV_IOCEVENTMASK_V2 */
   unsigned long event_mask;

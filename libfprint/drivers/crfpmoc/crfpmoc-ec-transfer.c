@@ -112,8 +112,22 @@ do_ioctl_xcmd (CrfpMocEcTransfer                 *transfer,
       return -1;
     }
 
+  /* Callers of variable-length commands opt in, and must bound their
+   * parsing by transfer->received rather than insize. */
+  if (transfer->variable_reply && r > transfer->insize)
+    {
+      g_set_error (error,
+                   FP_DEVICE_ERROR,
+                   FP_DEVICE_ERROR_PROTO,
+                   "Unexpected reply size: got %d, expected at most %d",
+                   r, transfer->insize);
+      return -1;
+    }
+
   if (transfer->insize > 0 && transfer->indata)
     memcpy (transfer->indata, s_cmd->data, MIN (r, transfer->insize));
+
+  transfer->received = MIN (r, transfer->insize);
 
   return r;
 }

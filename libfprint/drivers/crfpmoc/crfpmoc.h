@@ -242,6 +242,48 @@ struct crfpmoc_ec_response_fp_info
   guint32 template_version; /* version of the template format */
 } __attribute__((packed));
 
+/* EC_CMD_GET_CMD_VERSIONS (v1 takes a 16-bit command) and FP_INFO v2/v3.
+ * FP_INFO v2/v3 replies are a 36-byte fixed part (struct fp_sensor_info plus
+ * struct fp_template_info) followed by num_capture_types image frame records
+ * of 16 (v2) or 20 (v3) bytes. The firmware fills a buffer sized for
+ * FP_MAX_CAPTURE_TYPES records and zero-pads unused ones; it refuses the
+ * command unless the reply buffer can hold the full v3 size, for v2 too.
+ */
+#define CRFPMOC_EC_CMD_GET_CMD_VERSIONS 0x0008
+#define CRFPMOC_FP_MAX_CAPTURE_TYPES 9
+#define CRFPMOC_FP_INFO_V1_SIZE 48
+#define CRFPMOC_FP_INFO_V2V3_FIXED_SIZE 36
+#define CRFPMOC_FP_INFO_V2_FRAME_SIZE 16
+#define CRFPMOC_FP_INFO_V3_FRAME_SIZE 20
+#define CRFPMOC_FP_INFO_V2_MAX_SIZE \
+  (CRFPMOC_FP_INFO_V2V3_FIXED_SIZE + CRFPMOC_FP_MAX_CAPTURE_TYPES * CRFPMOC_FP_INFO_V2_FRAME_SIZE)
+#define CRFPMOC_FP_INFO_V3_MAX_SIZE \
+  (CRFPMOC_FP_INFO_V2V3_FIXED_SIZE + CRFPMOC_FP_MAX_CAPTURE_TYPES * CRFPMOC_FP_INFO_V3_FRAME_SIZE)
+/* Dead pixel count in 'errors'; all ones means unknown, not a fault. */
+#define CRFPMOC_FP_ERROR_DEAD_PIXELS_MASK 0x3FF
+
+/* Version-independent FP_INFO fields used by the driver. The frame fields
+ * describe the first advertised capture format, or are zero if none. */
+typedef struct
+{
+  guint32 vendor_id;
+  guint32 product_id;
+  guint32 model_id;
+  guint32 version;
+  guint16 num_capture_types;
+  guint16 errors;
+  guint32 frame_size;
+  guint32 pixel_format;
+  guint16 width;
+  guint16 height;
+  guint16 bpp;
+  guint16 template_max;
+  guint16 template_valid;
+  guint32 template_size;
+  guint32 template_dirty;
+  guint32 template_version;
+} CrfpMocFpInfo;
+
 /* Note: used in crfpmoc_ec_response_get_next_data_v1 */
 struct crfpmoc_ec_response_motion_sense_fifo_info
 {
@@ -446,8 +488,9 @@ enum crfpmoc_ec_status {
 /* Open state machine states
  */
 enum {
-  OPEN_GET_PROTO_INFO, /* Query protocol info (max in/out sizes) */
-  OPEN_GET_FP_INFO,    /* Query fingerprint sensor info */
+  OPEN_GET_PROTO_INFO,      /* Query protocol info (max in/out sizes) */
+  OPEN_GET_FP_INFO_VERSION, /* Negotiate the FP_INFO command version */
+  OPEN_GET_FP_INFO,         /* Query fingerprint sensor info */
   OPEN_STATES,
 };
 
