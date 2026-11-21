@@ -1595,7 +1595,8 @@ handle_enroll_reset (FpiSsm *ssm)
   CrfpMocEcTransfer *transfer;
 
   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
-                                          &p, sizeof (p), 0);
+                                          &p, sizeof (p),
+                                          sizeof (struct crfpmoc_ec_response_fp_mode));
   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
 }
 
@@ -1742,6 +1743,10 @@ crfpmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
 {
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case ENROLL_SENSOR_IDLE:
+      handle_enroll_reset (ssm);
+      break;
+
     case ENROLL_CHECK_CAPACITY:
       handle_enroll_check_capacity (ssm);
       break;
