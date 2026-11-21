@@ -21,6 +21,7 @@
 #define FP_COMPONENT "crfpmoc"
 
 #include <errno.h>
+#include <string.h>
 #include <sys/ioctl.h>
 
 #include "crfpmoc.h"
@@ -69,6 +70,25 @@ build_raw_cmd (CrfpMocEcTransfer *transfer)
     memcpy (s_cmd->data, transfer->outdata, transfer->outsize);
 
   return g_steal_pointer (&s_cmd);
+}
+
+static gsize
+raw_cmd_size (CrfpMocEcTransfer *transfer)
+{
+  return sizeof (struct crfpmoc_cros_ec_command_v2) +
+         MAX (transfer->outsize, transfer->insize);
+}
+
+/* Command buffers can hold the seed, the user context or templates: clear
+ * them before they go back to the allocator. */
+static void
+clear_and_free (gpointer data, gsize size)
+{
+  if (!data)
+    return;
+
+  explicit_bzero (data, size);
+  g_free (data);
 }
 
 static FpDeviceError
@@ -143,8 +163,8 @@ command_thread_func (GTask        *task,
                      GCancellable *cancellable)
 {
   CrfpMocEcTransfer *transfer = (CrfpMocEcTransfer *) task_data;
+  struct crfpmoc_cros_ec_command_v2 *s_cmd;
 
-  g_autofree struct crfpmoc_cros_ec_command_v2 *s_cmd = NULL;
   g_autoptr(GError) error = NULL;
   int r;
 
@@ -158,9 +178,10 @@ command_thread_func (GTask        *task,
   if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (transfer->device)))
     {
       transfer->raw_cmd = g_steal_pointer (&s_cmd);
-      transfer->raw_cmd_size = sizeof (struct crfpmoc_cros_ec_command_v2)
-                               + MAX (transfer->outsize, transfer->insize);
+      transfer->raw_cmd_size = raw_cmd_size (transfer);
     }
+
+  clear_and_free (g_steal_pointer (&s_cmd), raw_cmd_size (transfer));
 
   if (g_task_return_error_if_cancelled (task))
     return;
@@ -260,9 +281,9 @@ crfpmoc_ec_transfer_free (CrfpMocEcTransfer *transfer)
   if (!transfer)
     return;
 
-  g_clear_pointer (&transfer->outdata, g_free);
-  g_clear_pointer (&transfer->indata, g_free);
-  g_clear_pointer (&transfer->raw_cmd, g_free);
+  clear_and_free (g_steal_pointer (&transfer->outdata), transfer->outsize);
+  clear_and_free (g_steal_pointer (&transfer->indata), transfer->insize);
+  clear_and_free (g_steal_pointer (&transfer->raw_cmd), transfer->raw_cmd_size);
   g_free (transfer);
 }
 
@@ -364,7 +385,7 @@ gboolean
 crfpmoc_ec_transfer_submit_sync (CrfpMocEcTransfer *transfer,
                                  GError           **error)
 {
-  g_autofree struct crfpmoc_cros_ec_command_v2 *s_cmd = NULL;
+  struct crfpmoc_cros_ec_command_v2 *s_cmd;
   int r;
 
   g_assert (transfer != NULL);
@@ -377,6 +398,8 @@ crfpmoc_ec_transfer_submit_sync (CrfpMocEcTransfer *transfer,
   if (crfpmoc_umockdev_recording_enabled (FPI_DEVICE_CRFPMOC (transfer->device)))
     crfpmoc_umockdev_record (FPI_DEVICE_CRFPMOC (transfer->device), r,
                              CRFPMOC_CROS_EC_DEV_IOCXCMD_V2, s_cmd);
+
+  clear_and_free (s_cmd, raw_cmd_size (transfer));
 
   return r >= 0;
 }
